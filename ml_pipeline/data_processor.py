@@ -140,7 +140,7 @@ class DataProcessor:
         if onehot_cols:
             onehot_transformer = Pipeline(steps=[
                 ('imputer', SimpleImputer(strategy='most_frequent')),
-                ('onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore'))
+                ('onehot', OneHotEncoder(sparse=False, handle_unknown='ignore'))
             ])
             transformers.append(('onehot', onehot_transformer, onehot_cols))
         
@@ -148,7 +148,7 @@ class DataProcessor:
         onehot_na_cols = [col for col in self.one_hot_features if col in self.leave_as_na_features]
         if onehot_na_cols:
             onehot_na_transformer = Pipeline(steps=[
-                ('onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore'))
+                ('onehot', OneHotEncoder(sparse=False, handle_unknown='ignore'))
             ])
             transformers.append(('onehot_na', onehot_na_transformer, onehot_na_cols))
         

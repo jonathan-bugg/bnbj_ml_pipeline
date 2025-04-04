@@ -263,6 +263,7 @@ class DataLoader:
                         'True': True, 'true': True, '1': True, 1: True, 
                         'False': False, 'false': False, '0': False, 0: False
                     }, na_action='ignore')
+                    data[feature_name] = data[feature_name].astype(bool)
             elif feature_type in ["float", "number"]:
                 # Convert to float, ignoring errors for now (they'll be handled in preprocessing)
                 data[feature_name] = pd.to_numeric(data[feature_name], errors='coerce')
