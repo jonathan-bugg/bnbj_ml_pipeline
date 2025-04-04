@@ -1,6 +1,6 @@
 {
   "training": false,
-  "metadata_file_path": "input_data_info.json",
+  "metadata_file_path": "feature_metadata.xlsx",
   "input_data_source": "CSV",
   "file_path": "example_inputs_test_v1.csv",
   "data_processor_file_path": "trained_model_outputs_path/target_classification_lgbm_data_processor.pkl",

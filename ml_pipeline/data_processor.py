@@ -171,7 +171,7 @@ class DataProcessor:
         return ColumnTransformer(
             transformers=transformers,
             remainder='passthrough'
-        )
+        ).set_output(transform='pandas')
     
     def _prepare_data_for_training(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         """

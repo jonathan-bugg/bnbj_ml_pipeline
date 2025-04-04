@@ -3,16 +3,17 @@ import pickle
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Any, Optional, Union
-import lightgbm as lgbm
 
 from ml_pipeline.data_loader import DataLoader
 from ml_pipeline.data_processor import DataProcessor
+from ml_pipeline.lgbm_model import LGBMModel
+from ml_pipeline.feature_importance import FeatureImportance
 
 
 class ML_Pipeline:
     """
     Main class for the ML pipeline that integrates data loading, preprocessing,
-    model training, and prediction.
+    model training, and feature importance analysis.
     """
     
     def __init__(self, modeling_config: str, data_config: str):
@@ -50,8 +51,10 @@ class ML_Pipeline:
         
         # Variables to store model and predictions
         self.model = None
+        self.lgbm_model = None  # Store the LGBMModel instance
         self.predictions = None
         self.model_performances = []
+        self.feature_importance = None  # Store feature importance results
         
     def run(self) -> None:
         """
@@ -73,7 +76,8 @@ class ML_Pipeline:
         1. Loading and preprocessing the training data
         2. Training a model using k-fold cross-validation
         3. Retraining on the full dataset if specified
-        4. Saving the model and preprocessor
+        4. Calculating feature importance if specified
+        5. Saving the model and preprocessor
         """
         print("Starting training pipeline...")
         
@@ -92,6 +96,10 @@ class ML_Pipeline:
         # Retrain on the full dataset if specified
         if self.model_config.get("retrain_with_whole_dataset", True):
             self._retrain_on_full_dataset(data)
+            
+            # Calculate feature importance if a model was trained
+            if self.model is not None and self.lgbm_model is not None:
+                self._calculate_feature_importance(data)
         
         print("Training pipeline completed.")
     
@@ -117,7 +125,7 @@ class ML_Pipeline:
         
         # Preprocess test data
         X_test, id_data = self.data_processor.preprocess_test_data(data)
-        
+  
         # Load the model
         model_path = self.data_config.get("model_file_path", "")
         self._load_model(model_path)
@@ -146,114 +154,35 @@ class ML_Pipeline:
         
         print(f"Training {model_type} models for {problem_type} problem...")
         
+        # Initialize the model
+        if model_type == "lgbm":
+            self.lgbm_model = LGBMModel(
+                model_config=self.model_config,
+                output_dir=self.output_dir
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+        
         # Train a model for each fold
-        for fold_idx, fold_data in enumerate(preprocessed_data['folds']):
+        for fold_idx, _ in enumerate(preprocessed_data['folds']):
             print(f"Training fold {fold_idx + 1}/{len(preprocessed_data['folds'])}...")
             
-            X_train = fold_data['X_train_transformed']
-            y_train = fold_data['y_train']
-            X_val = fold_data['X_val_transformed']
-            y_val = fold_data['y_val']
-            
-            # Train model
+            # Train model using the LGBMModel class
             if model_type == "lgbm":
-                model = self._train_lgbm_model(X_train, y_train, X_val, y_val)
+                self.lgbm_model.train_with_cv_data(preprocessed_data, fold_idx)
+                
+                # Get performance metrics for this fold
+                fold_performance = self.lgbm_model.get_performance_metrics()
+                
+                # Store performance
+                self.model_performances.append({
+                    'fold_idx': fold_idx,
+                    'performance': fold_performance.get('val', None)
+                })
+                
+                print(f"Fold {fold_idx + 1} performance: {fold_performance.get('val', None)}")
             else:
                 raise ValueError(f"Unsupported model type: {model_type}")
-            
-            # Evaluate model
-            performance = self._evaluate_model(model, X_val, y_val)
-            self.model_performances.append({
-                'fold_idx': fold_idx,
-                'performance': performance
-            })
-            
-            print(f"Fold {fold_idx + 1} performance: {performance}")
-    
-    def _train_lgbm_model(self, X_train, y_train, X_val, y_val):
-        """
-        Train a LightGBM model.
-        
-        Args:
-            X_train: Training features
-            y_train: Training target
-            X_val: Validation features
-            y_val: Validation target
-            
-        Returns:
-            Trained LightGBM model
-        """
-        problem_type = self.model_config.get("problem_type", "classification")
-        
-        # Set up LGBM parameters
-        params = {
-            'objective': 'binary' if problem_type == 'classification' else 'regression',
-            'metric': 'auc' if problem_type == 'classification' else 'rmse',
-            'boosting_type': 'gbdt',
-            'learning_rate': 0.05,
-            'num_leaves': 31,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'verbose': -1
-        }
-        
-        # Create dataset
-        train_data = lgbm.Dataset(X_train, label=y_train)
-        val_data = lgbm.Dataset(X_val, label=y_val, reference=train_data)
-        
-        # Train model
-        model = lgbm.train(
-            params,
-            train_data,
-            valid_sets=[train_data, val_data],
-            num_boost_round=1000,
-            early_stopping_rounds=50,
-            verbose_eval=100
-        )
-        
-        return model
-    
-    def _evaluate_model(self, model, X_val, y_val):
-        """
-        Evaluate a model on validation data.
-        
-        Args:
-            model: Trained model
-            X_val: Validation features
-            y_val: Validation target
-            
-        Returns:
-            Performance metric value
-        """
-        problem_type = self.model_config.get("problem_type", "classification")
-        evaluation_metric = self.model_config.get("evaluation_metric", "rocauc")
-        
-        # Make predictions
-        if problem_type == "classification":
-            y_pred = model.predict(X_val)
-            
-            # Calculate performance metric
-            if evaluation_metric == "rocauc":
-                from sklearn.metrics import roc_auc_score
-                return roc_auc_score(y_val, y_pred)
-            elif evaluation_metric == "accuracy":
-                from sklearn.metrics import accuracy_score
-                return accuracy_score(y_val, y_pred > 0.5)
-            else:
-                raise ValueError(f"Unsupported evaluation metric: {evaluation_metric}")
-        else:
-            y_pred = model.predict(X_val)
-            
-            # Calculate performance metric
-            if evaluation_metric == "rmse":
-                from sklearn.metrics import mean_squared_error
-                return mean_squared_error(y_val, y_pred, squared=False)
-            elif evaluation_metric == "mae":
-                from sklearn.metrics import mean_absolute_error
-                return mean_absolute_error(y_val, y_pred)
-            else:
-                raise ValueError(f"Unsupported evaluation metric: {evaluation_metric}")
     
     def _retrain_on_full_dataset(self, data: pd.DataFrame) -> None:
         """
@@ -266,42 +195,99 @@ class ML_Pipeline:
         
         # Preprocess the full dataset
         X_transformed, y = self.data_processor.fit_transform_full_dataset(data)
-        
+
         # Train model on full dataset
         model_type = self.model_config.get("models", ["lgbm"])[0]
         
         if model_type == "lgbm":
-            problem_type = self.model_config.get("problem_type", "classification")
+            # Ensure we have a model instance
+            if self.lgbm_model is None:
+                self.lgbm_model = LGBMModel(
+                    model_config=self.model_config,
+                    output_dir=self.output_dir
+                )
             
-            # Set up LGBM parameters
-            params = {
-                'objective': 'binary' if problem_type == 'classification' else 'regression',
-                'metric': 'auc' if problem_type == 'classification' else 'rmse',
-                'boosting_type': 'gbdt',
-                'learning_rate': 0.05,
-                'num_leaves': 31,
-                'feature_fraction': 0.8,
-                'bagging_fraction': 0.8,
-                'bagging_freq': 5,
-                'verbose': -1
-            }
+            # Train on full dataset
+            self.lgbm_model.train_with_full_dataset(X_transformed, y)
             
-            # Create dataset
-            train_data = lgbm.Dataset(X_transformed, label=y)
+            # Store the model
+            self.model = self.lgbm_model.model
             
-            # Train model
-            self.model = lgbm.train(
-                params,
-                train_data,
-                num_boost_round=1000
-            )
+            # Save the model
+            model_path = self.lgbm_model.save_model()
+            print(f"Model saved to {model_path}")
+            
+            # Save hyperparameter study results if available
+            try:
+                if self.lgbm_model.study_results:
+                    study_path = self.lgbm_model.save_hyperparameter_study()
+                    print(f"Hyperparameter study results saved to {study_path}")
+            except Exception as e:
+                print(f"Error saving hyperparameter study: {str(e)}")
+                
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
         
-        # Save the model
-        self._save_model()
-        
         print("Full dataset retraining completed.")
+    
+    def _calculate_feature_importance(self, data: pd.DataFrame) -> None:
+        """
+        Calculate feature importance for the trained model.
+        
+        Args:
+            data: Full training dataset
+        """
+        # Only proceed if we have a trained model
+        if self.model is None:
+            print("No trained model available for feature importance calculation.")
+            return
+        
+        print("Calculating feature importance...")
+        
+        # Get feature names
+        feature_names = []
+        for _, feature in self.feature_metadata.iterrows():
+            feature_name = feature["feature_name"]
+            feature_use = feature["use"]
+            
+            # Skip if not used in model or if it's an ID column or target
+            if feature_use != 1 or feature_name in self.model_config.get("id_variables", []) or feature_name == self.model_config.get("target_variable", ""):
+                continue
+                
+            feature_names.append(feature_name)
+        
+        # Get preprocessed data
+        X_transformed, _ = self.data_processor.fit_transform_full_dataset(data)
+        
+        # Initialize feature importance with the specified method
+        importance_method = self.model_config.get("importance_extraction_method", "shap")
+        
+        try:
+            # Create feature importance calculator
+            self.feature_importance = FeatureImportance(
+                model_config=self.model_config,
+                feature_names=feature_names,
+                output_dir=self.output_dir
+            )
+            
+            # Calculate importance
+            importance_results = self.feature_importance.calculate_importance(self.model, X_transformed)
+            
+            # Save results
+            results_path = self.feature_importance.save_importance_results()
+            values_path = self.feature_importance.save_importance_values()
+            
+            print(f"Feature importance calculated using {importance_method}.")
+            print(f"Results saved to {results_path}")
+            print(f"Values saved to {values_path}")
+            
+            # Display top important features
+            importance_df = self.feature_importance.get_importance_df()
+            print("\nTop 10 important features:")
+            print(importance_df.head(10))
+            
+        except Exception as e:
+            print(f"Error calculating feature importance: {str(e)}")
     
     def _save_model(self, file_path: str = None) -> str:
         """
@@ -323,6 +309,7 @@ class ML_Pipeline:
         if self.model is not None:
             with open(file_path, 'wb') as f:
                 pickle.dump(self.model, f)
+            print(f"Model saved to {file_path}")
         else:
             raise ValueError("Model has not been trained yet.")
         
@@ -337,6 +324,7 @@ class ML_Pipeline:
         """
         with open(file_path, 'rb') as f:
             self.model = pickle.load(f)
+        print(f"Model loaded from {file_path}")
     
     def _predict(self, X_test) -> np.ndarray:
         """
@@ -371,4 +359,15 @@ class ML_Pipeline:
         Returns:
             List of dictionaries containing performance metrics for each fold
         """
-        return self.model_performances 
+        return self.model_performances
+    
+    def get_feature_importance(self) -> pd.DataFrame:
+        """
+        Get the feature importance results.
+        
+        Returns:
+            DataFrame containing feature importance results
+        """
+        if self.feature_importance is not None:
+            return self.feature_importance.get_importance_df()
+        return None 
