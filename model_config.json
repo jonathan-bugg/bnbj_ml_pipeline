@@ -1,0 +1,25 @@
+{
+  "target_variable": "target",
+  "id_variables" : ["id_col", "date_col"],
+  "problem_type": "classification",
+  "evaluation_metric": "rocauc",
+  "better_performance": "gt",
+  "models": ["lgbm"],
+  "k_folds": 5,
+  "retrain_with_whole_dataset": true,
+  "sample_for_contribution": 1.0,
+  "importance_extraction_method": "treeinterpreter",
+  "num_hp_searches": 5, 
+  "hyperparameter_space": {
+    "lgbm": {
+      "boosting_type": "trial.suggest_categorical('boosting_type', ['gbdt'])",
+      "learning_rate": "trial.suggest_loguniform('learning_rate', 0.01, 0.2)",
+      "num_leaves": "int(trial.suggest_discrete_uniform('num_leaves', 30, 150, 1))",
+      "feature_fraction": "trial.suggest_uniform('feature_fraction', 0.1, 1.0)",
+      "reg_lambda": "trial.suggest_uniform('reg_lambda', 0.0, 0.1)",
+      "n_estimators": "int(trial.suggest_discrete_uniform('n_estimators', 100, 200, 1))",
+      "class_weight": "trial.suggest_categorical('class_weight', [None, 'balanced'])",
+      "min_data_in_leaf": "int(trial.suggest_discrete_uniform('min_data_in_leaf', 10, 1000, 5))"
+    }
+  }
+}

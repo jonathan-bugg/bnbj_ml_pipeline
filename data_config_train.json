@@ -1,0 +1,6 @@
+{
+  "training": true,
+  "metadata_file_path": "/Users/jonathanbugg/Desktop/new_ml_pipeline/bb_ml_pipeline/feature_metadata.xlsx",
+  "input_data_source": "CSV",
+  "file_path": "/Users/jonathanbugg/Desktop/new_ml_pipeline/bb_ml_pipeline/example_inputs_v1.csv"
+}
