@@ -12,11 +12,9 @@ from sklearn.impute import SimpleImputer
 
 class DataProcessor:
     """
-    Class for preprocessing data for LGBM models.
+    Class for preprocessing data for ML models.
     
-    This class prepares pandas dataframes for training in LGBM models.
-    For training, it splits data into k-fold cross validation sets.
-    For testing, it uses a saved data transformer to preprocess the test data.
+    This class prepares pandas dataframes for model training and inference.
     """
     
     def __init__(self, 
@@ -29,7 +27,7 @@ class DataProcessor:
         Args:
             feature_metadata: DataFrame containing the feature metadata
             model_config: Dictionary containing the model configuration
-            output_dir: Directory to save outputs to (default: 'trained_model_outputs_path')
+            output_dir: Directory to save outputs to
         """
         self.feature_metadata = feature_metadata
         self.model_config = model_config
@@ -38,23 +36,25 @@ class DataProcessor:
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # Store preprocessing attributes
+        # Extract configuration
         self.id_columns = model_config.get("id_variables", [])
         self.target_column = model_config.get("target_variable", "")
         self.k_folds = model_config.get("k_folds", 5)
         self.problem_type = model_config.get("problem_type", "classification")
         
-        # Extract feature information from metadata
+        # Initialize feature lists
         self.numerical_features = []
         self.categorical_features = []
         self.binary_features = []
         self.one_hot_features = []
         self.leave_as_na_features = []
-        
         self._prepare_feature_lists()
         
         # Preprocessing pipeline
         self.preprocessor = None
+        
+        # Store mappings for categorical features
+        self.categorical_mappings = {}
         
     def _prepare_feature_lists(self) -> None:
         """
@@ -115,12 +115,6 @@ class DataProcessor:
             ])
             transformers.append(('num', num_transformer, numerical_cols))
         
-        # Numerical features with missing values preserved
-        numerical_na_cols = [col for col in self.numerical_features if col in self.leave_as_na_features]
-        if numerical_na_cols:
-            # We will handle these by not transforming them
-            pass
-        
         # Categorical features (not one-hot encoded)
         cat_cols = [col for col in self.categorical_features if col not in self.leave_as_na_features]
         if cat_cols:
@@ -128,12 +122,6 @@ class DataProcessor:
                 ('imputer', SimpleImputer(strategy='most_frequent'))
             ])
             transformers.append(('cat', cat_transformer, cat_cols))
-        
-        # Categorical features with missing values preserved
-        cat_na_cols = [col for col in self.categorical_features if col in self.leave_as_na_features]
-        if cat_na_cols:
-            # We will handle these by not transforming them
-            pass
         
         # One-hot encoded features
         onehot_cols = [col for col in self.one_hot_features if col not in self.leave_as_na_features]
@@ -155,17 +143,10 @@ class DataProcessor:
         # Binary features
         bin_cols = [col for col in self.binary_features if col not in self.leave_as_na_features]
         if bin_cols:
-            # For binary features, we will simply impute with 0 (unless otherwise specified)
             bin_transformer = Pipeline(steps=[
                 ('imputer', SimpleImputer(strategy='constant', fill_value=0))
             ])
             transformers.append(('bin', bin_transformer, bin_cols))
-        
-        # Binary features with missing values preserved
-        bin_na_cols = [col for col in self.binary_features if col in self.leave_as_na_features]
-        if bin_na_cols:
-            # We will handle these by not transforming them
-            pass
         
         # Create the column transformer
         return ColumnTransformer(
@@ -173,26 +154,37 @@ class DataProcessor:
             remainder='passthrough'
         ).set_output(transform='pandas')
     
-    def _prepare_data_for_training(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    def _handle_non_numeric_values(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Prepare the data for training by removing ID columns.
+        Handle non-numeric values in all columns by encoding or converting them.
         
         Args:
-            data: DataFrame containing the input data
+            X: DataFrame containing the features
             
         Returns:
-            Tuple containing X (features) and y (target)
+            DataFrame with non-numeric values converted to numeric
         """
-        # Create a copy to avoid modifying the original data
-        df = data.copy()
+        X_copy = X.copy()
         
-        # Extract the target variable
-        y = df[self.target_column]
+        # Process all columns
+        for col in X_copy.columns:
+            # Check if column has non-numeric values
+            try:
+                X_copy[col] = pd.to_numeric(X_copy[col], errors='raise')
+            except ValueError:
+                print(f"Error converting data to numeric: could not convert string to float in column {col}")
+                # Handle non-numeric values by encoding them
+                if X_copy[col].dtype == 'object':
+                    # Create a mapping dictionary if not already present
+                    if col not in self.categorical_mappings:
+                        unique_values = X_copy[col].astype(str).unique()
+                        self.categorical_mappings[col] = {val: i for i, val in enumerate(unique_values)}
+                    
+                    # Apply mapping
+                    X_copy[col] = X_copy[col].astype(str).map(self.categorical_mappings[col])
+                    print(f"Column {col} contains non-numeric values. Converting to numeric encoding.")
         
-        # Remove ID columns and target variable from features
-        X = df.drop(columns=self.id_columns + [self.target_column])
-        
-        return X, y
+        return X_copy
     
     def _handle_binary_features(self, X: pd.DataFrame) -> pd.DataFrame:
         """
@@ -208,119 +200,124 @@ class DataProcessor:
         
         for col in self.binary_features:
             if col in X_copy.columns:
-                # Convert binary columns to numeric (0/1)
-                X_copy[col] = X_copy[col].astype(float)
+                try:
+                    X_copy[col] = X_copy[col].astype(float)
+                except ValueError:
+                    # Let the more comprehensive handler take care of this
+                    pass
                 
         return X_copy
     
-    def create_folds(self, data: pd.DataFrame) -> List[Tuple[np.ndarray, np.ndarray]]:
+    def process_data(self, data: pd.DataFrame, is_training: bool = True, create_folds: bool = True) -> Dict[str, Any]:
         """
-        Create k-fold cross-validation indices.
+        Process data for training or inference.
         
         Args:
             data: DataFrame containing the input data
+            is_training: Whether this is for training (True) or inference (False)
+            create_folds: Whether to create cross-validation folds (True for CV, False for full dataset training)
             
         Returns:
-            List of tuples containing train and validation indices for each fold
+            Dictionary containing the processed data
         """
-        X, y = self._prepare_data_for_training(data)
+        # Create a copy to avoid modifying the original data
+        df = data.copy()
         
-        # Choose the right K-Fold class based on the problem type
-        if self.problem_type == "classification":
-            kf = StratifiedKFold(n_splits=self.k_folds, shuffle=True, random_state=42)
-            fold_indices = list(kf.split(X, y))
+        # Extract target and features
+        if is_training:
+            y = df[self.target_column]
+            X = df.drop(columns=self.id_columns + [self.target_column])
         else:
-            kf = KFold(n_splits=self.k_folds, shuffle=True, random_state=42)
-            fold_indices = list(kf.split(X))
+            # For inference, extract ID columns and no target
+            id_data = {col: df[col] for col in self.id_columns if col in df.columns}
+            X = df.drop(columns=[col for col in self.id_columns if col in df.columns])
+            y = None
         
-        return fold_indices
-    
-    def preprocess_training_data(self, data: pd.DataFrame, fold_indices: List[Tuple[np.ndarray, np.ndarray]] = None) -> Dict[str, Any]:
-        """
-        Preprocess the training data using k-fold cross-validation.
+        # Handle non-numeric values
+        # X = self._handle_non_numeric_values(X)
         
-        Args:
-            data: DataFrame containing the input data
-            fold_indices: List of tuples containing train and validation indices for each fold
-            
-        Returns:
-            Dictionary containing the preprocessed data for each fold
-        """
-        X, y = self._prepare_data_for_training(data)
+        # Handle binary features
         X = self._handle_binary_features(X)
         
-        # If fold indices are not provided, create them
-        if fold_indices is None:
-            fold_indices = self.create_folds(data)
+        # # Verify all values are numeric
+        # for col in X.columns:
+        #     try:
+        #         X[col] = X[col].astype(float)
+        #     except Exception as e:
+        #         print(f"WARNING: Column {col} still has non-numeric values after preprocessing: {str(e)}")
+        #         # Force conversion for problematic columns
+        #         X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
+                
+        # print(f"Data converted to numeric after fixing: X shape: {X.shape}, dtypes: {X.dtypes}")
         
-        # Store preprocessed data for each fold
-        preprocessed_data = {
-            'original_data': data,
+        # Initialize result dictionary
+        result = {
             'X': X,
-            'y': y,
-            'folds': []
+            'y': y
         }
         
-        # For each fold, fit the preprocessor on the training data and transform both train and validation data
-        for fold_idx, (train_idx, val_idx) in enumerate(fold_indices):
-            # Initialize the preprocessor
+        if not is_training:
+            # For inference, transform the data using a previously fit preprocessor
+            if self.preprocessor is None:
+                raise ValueError("Preprocessor has not been fitted or loaded yet.")
+            
+            X_transformed = self.preprocessor.transform(X)
+            result['X_transformed'] = X_transformed
+            result['id_data'] = id_data
+            return result
+            
+        # For training mode
+        if create_folds:
+            # Create fold indices for cross-validation
+            if self.problem_type == "classification":
+                kf = StratifiedKFold(n_splits=self.k_folds, shuffle=True, random_state=42)
+                fold_indices = list(kf.split(X, y))
+            else:
+                kf = KFold(n_splits=self.k_folds, shuffle=True, random_state=42)
+                fold_indices = list(kf.split(X))
+                
+            # Store preprocessed data for each fold
+            folds = []
+            
+            for fold_idx, (train_idx, val_idx) in enumerate(fold_indices):
+                # Get train and validation data
+                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+                
+                # Initialize and fit the preprocessor on the training data
+                self.preprocessor = self._build_preprocessor()
+                X_train_transformed = self.preprocessor.fit_transform(X_train)
+                
+                # Transform the validation data
+                X_val_transformed = self.preprocessor.transform(X_val)
+                
+                # Store the fold data
+                fold_data = {
+                    'fold_idx': fold_idx,
+                    'train_idx': train_idx,
+                    'val_idx': val_idx,
+                    'X_train': X_train,
+                    'y_train': y_train,
+                    'X_val': X_val,
+                    'y_val': y_val,
+                    'X_train_transformed': X_train_transformed,
+                    'X_val_transformed': X_val_transformed,
+                    'preprocessor': self.preprocessor
+                }
+                
+                folds.append(fold_data)
+                
+            result['folds'] = folds
+        else:
+            # For full dataset training, fit the preprocessor on the entire dataset
             self.preprocessor = self._build_preprocessor()
+            X_transformed = self.preprocessor.fit_transform(X)
+            result['X_transformed'] = X_transformed
             
-            # Get train and validation data
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            # Save the fitted preprocessor
+            self.save_preprocessor()
             
-            # Convert binary features to numeric for both train and validation sets
-            X_train = self._handle_binary_features(X_train)
-            X_val = self._handle_binary_features(X_val)
-            
-            # Fit the preprocessor on the training data
-            X_train_transformed = self.preprocessor.fit_transform(X_train)
-            
-            # Transform the validation data
-            X_val_transformed = self.preprocessor.transform(X_val)
-            
-            # Store the fold data
-            fold_data = {
-                'fold_idx': fold_idx,
-                'train_idx': train_idx,
-                'val_idx': val_idx,
-                'X_train': X_train,
-                'y_train': y_train,
-                'X_val': X_val,
-                'y_val': y_val,
-                'X_train_transformed': X_train_transformed,
-                'X_val_transformed': X_val_transformed,
-                'preprocessor': self.preprocessor
-            }
-            
-            preprocessed_data['folds'].append(fold_data)
-        
-        return preprocessed_data
-    
-    def fit_transform_full_dataset(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Fit the preprocessor on the full dataset and transform it.
-        
-        Args:
-            data: DataFrame containing the input data
-            
-        Returns:
-            Tuple containing the transformed X and y
-        """
-        X, y = self._prepare_data_for_training(data)
-        X = self._handle_binary_features(X)
-        
-        # Initialize the preprocessor
-        self.preprocessor = self._build_preprocessor()
-        
-        # Fit and transform the full dataset
-        X_transformed = self.preprocessor.fit_transform(X)
-        
-        # Save the fitted preprocessor
-        self.save_preprocessor()
-        
-        return X_transformed, y
+        return result
     
     def save_preprocessor(self, file_path: str = None) -> str:
         """
@@ -340,8 +337,13 @@ class DataProcessor:
             file_path = os.path.join(self.output_dir, f"{target_var}_{problem_type}_{model_type}_data_processor.pkl")
         
         if self.preprocessor is not None:
+            # Save preprocessor and categorical mappings together
+            to_save = {
+                'preprocessor': self.preprocessor,
+                'categorical_mappings': self.categorical_mappings
+            }
             with open(file_path, 'wb') as f:
-                pickle.dump(self.preprocessor, f)
+                pickle.dump(to_save, f)
         else:
             raise ValueError("Preprocessor has not been fitted yet.")
         
@@ -355,37 +357,15 @@ class DataProcessor:
             file_path: Path to the saved preprocessor file
         """
         with open(file_path, 'rb') as f:
-            self.preprocessor = pickle.load(f)
-    
-    def preprocess_test_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Preprocess the test data using a previously fitted preprocessor.
-        
-        Args:
-            data: DataFrame containing the test data
+            saved_data = pickle.load(f)
             
-        Returns:
-            Preprocessed test data
-        """
-        if self.preprocessor is None:
-            raise ValueError("Preprocessor has not been fitted or loaded yet.")
-        
-        # Create a copy to avoid modifying the original data
-        df = data.copy()
-        
-        # Extract ID columns before preprocessing
-        id_data = {col: df[col] for col in self.id_columns if col in df.columns}
-        
-        # Remove ID columns from features
-        X = df.drop(columns=[col for col in self.id_columns if col in df.columns])
-        
-        # Handle binary features
-        X = self._handle_binary_features(X)
-        
-        # Transform the data
-        X_transformed = self.preprocessor.transform(X)
-        
-        return X_transformed, id_data
+        # Handle both old and new format
+        if isinstance(saved_data, dict):
+            self.preprocessor = saved_data.get('preprocessor')
+            self.categorical_mappings = saved_data.get('categorical_mappings', {})
+        else:
+            self.preprocessor = saved_data
+            self.categorical_mappings = {}
     
     def add_ids_to_predictions(self, predictions: np.ndarray, id_data: Dict[str, pd.Series]) -> pd.DataFrame:
         """

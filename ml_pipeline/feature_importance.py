@@ -35,40 +35,75 @@ class FeatureImportance:
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # Store attributes
+        # Extract configuration
         self.target_variable = model_config.get("target_variable", "target")
         self.importance_method = model_config.get("importance_extraction_method", "shap")
         self.sample_fraction = model_config.get("sample_for_contribution", 1.0)
         
-        # Variables to store feature importance results
+        # Storage for results
         self.importance_values = None
         self.importance_df = None
         self.feature_importance_rankings = None
     
     def calculate_importance(self, 
                           model: Any, 
-                          X: np.ndarray, 
-                          sample_fraction: float = None) -> Dict[str, Any]:
+                          X: np.ndarray,
+                          method: str = None) -> Dict[str, Any]:
         """
         Calculate feature importance using the specified method.
         
         Args:
             model: Trained model
             X: Features to calculate importance for
-            sample_fraction: Fraction of the data to use for feature importance calculation (default: None)
+            method: Method to use (overrides self.importance_method if provided)
             
         Returns:
             Dictionary containing feature importance results
         """
-        if sample_fraction is None:
-            sample_fraction = self.sample_fraction
+        importance_method = method if method else self.importance_method
         
+        # Sample data if needed
+        X_sample = self._prepare_sample(X)
+        
+        # Calculate feature importance using specified method
+        try:
+            if importance_method.lower() == "shap":
+                return self._calculate_shap_importance(model, X_sample)
+            elif importance_method.lower() == "treeinterpreter":
+                return self._calculate_treeinterpreter_importance(model, X_sample)
+            else:
+                print(f"Unsupported importance method: {importance_method}. Falling back to SHAP.")
+                return self._calculate_shap_importance(model, X_sample)
+        except Exception as e:
+            print(f"Error calculating feature importance with {importance_method}: {str(e)}")
+            # If specified method fails, try the other method
+            if importance_method.lower() == "shap":
+                print("Trying treeinterpreter instead...")
+                try:
+                    return self._calculate_treeinterpreter_importance(model, X_sample)
+                except Exception as e2:
+                    print(f"Error with treeinterpreter fallback: {str(e2)}")
+                    raise ValueError("Both SHAP and treeinterpreter methods failed.")
+            else:
+                print("Falling back to SHAP...")
+                return self._calculate_shap_importance(model, X_sample)
+    
+    def _prepare_sample(self, X: np.ndarray) -> np.ndarray:
+        """
+        Prepare a sample of data for feature importance calculation.
+        
+        Args:
+            X: Input features
+            
+        Returns:
+            Sampled features array
+        """
         # If sample_fraction is less than 1.0, sample a subset of the data
-        if sample_fraction < 1.0:
-            if sample_fraction <= 0.0:
+        if self.sample_fraction < 1.0:
+            if self.sample_fraction <= 0.0:
                 raise ValueError("sample_fraction must be greater than 0.")
             
-            n_samples = int(X.shape[0] * sample_fraction)
+            n_samples = int(X.shape[0] * self.sample_fraction)
             if n_samples < 1:
                 n_samples = 1
             
@@ -76,18 +111,69 @@ class FeatureImportance:
             sample_indices = np.random.choice(X.shape[0], n_samples, replace=False)
             X_sample = X[sample_indices]
             
-            print(f"Using {n_samples} samples ({sample_fraction * 100:.1f}% of data) for feature importance calculation")
+            print(f"Using {n_samples} samples ({self.sample_fraction * 100:.1f}% of data) for feature importance calculation")
         else:
             X_sample = X
             print(f"Using all {X.shape[0]} samples for feature importance calculation")
+            
+        return X_sample
+    
+    def _process_importance_values(self, feature_importance_values: np.ndarray, method: str) -> Dict[str, Any]:
+        """
+        Process the raw importance values into a DataFrame and rankings.
         
-        # Calculate feature importance
-        if self.importance_method.lower() == "shap":
-            return self._calculate_shap_importance(model, X_sample)
-        elif self.importance_method.lower() == "treeinterpreter":
-            return self._calculate_treeinterpreter_importance(model, X_sample)
+        Args:
+            feature_importance_values: Raw importance values
+            method: Method used to calculate importance
+            
+        Returns:
+            Dictionary containing processed results
+        """
+        # Store the raw values
+        self.importance_values = feature_importance_values
+        
+        # Calculate mean absolute values for each feature
+        mean_abs_values = np.abs(feature_importance_values).mean(axis=0)
+        
+        # Create DataFrame with feature names and importance values
+        if self.feature_names is not None:
+            # Make sure feature_names length matches
+            if len(self.feature_names) != mean_abs_values.shape[0]:
+                print(f"Warning: feature_names length ({len(self.feature_names)}) doesn't match "
+                      f"number of features ({mean_abs_values.shape[0]}). Using generic feature names.")
+                feature_names = [f"feature_{i}" for i in range(mean_abs_values.shape[0])]
+            else:
+                feature_names = self.feature_names
+                
+            # Create DataFrame
+            self.importance_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance': mean_abs_values
+            })
         else:
-            raise ValueError(f"Unsupported importance method: {self.importance_method}")
+            # Create with generic names
+            self.importance_df = pd.DataFrame({
+                'feature': [f"feature_{i}" for i in range(mean_abs_values.shape[0])],
+                'importance': mean_abs_values
+            })
+        
+        # Sort by importance
+        self.importance_df = self.importance_df.sort_values('importance', ascending=False)
+        
+        # Create feature rankings
+        self.feature_importance_rankings = self.importance_df.copy()
+        self.feature_importance_rankings['rank'] = range(1, len(self.feature_importance_rankings) + 1)
+        
+        # Return results dictionary
+        results = {
+            'method': method,
+            'values': feature_importance_values,
+            'mean_abs_values': mean_abs_values,
+            'importance_df': self.importance_df,
+            'rankings': self.feature_importance_rankings
+        }
+        
+        return results
     
     def _calculate_shap_importance(self, model: Any, X: np.ndarray) -> Dict[str, Any]:
         """
@@ -102,57 +188,23 @@ class FeatureImportance:
         """
         print("Calculating SHAP feature importance...")
         
-        # Create SHAP explainer
-        explainer = shap.TreeExplainer(model)
-        
-        # Calculate SHAP values
-        shap_values = explainer.shap_values(X)
-        
-        # For classification with multiple classes, shap_values will be a list
-        if isinstance(shap_values, list):
-            # For binary classification, we usually want the second class (positive class)
-            shap_values = shap_values[0]
-        
-        # Store feature importance values
-        self.importance_values = shap_values
-        
-        # Calculate mean absolute SHAP values for each feature
-        mean_abs_shap = np.abs(shap_values).mean(axis=0)
-        
-        # Create DataFrame with feature names and importance values
-        if self.feature_names is not None:
-            # Make sure feature_names length matches the number of features
-            if len(self.feature_names) != mean_abs_shap.shape[0]:
-                print(f"Warning: feature_names length ({len(self.feature_names)}) doesn't match "
-                      f"number of features ({mean_abs_shap.shape[0]}). Using generic feature names.")
-                self.feature_names = [f"feature_{i}" for i in range(mean_abs_shap.shape[0])]
+        try:
+            # Create SHAP explainer
+            explainer = shap.TreeExplainer(model)
             
-            # Create feature importance DataFrame
-            self.importance_df = pd.DataFrame({
-                'feature': self.feature_names,
-                'importance': mean_abs_shap
-            })
-        else:
-            # Create feature importance DataFrame with generic feature names
-            self.importance_df = pd.DataFrame({
-                'feature': [f"feature_{i}" for i in range(mean_abs_shap.shape[0])],
-                'importance': mean_abs_shap
-            })
-        
-        # Sort by importance
-        self.importance_df = self.importance_df.sort_values('importance', ascending=False)
-        
-        # Create feature rankings
-        self.feature_importance_rankings = self.importance_df.copy()
-        self.feature_importance_rankings['rank'] = range(1, len(self.feature_importance_rankings) + 1)
-        
-        return {
-            'method': 'shap',
-            'values': shap_values,
-            'mean_abs_values': mean_abs_shap,
-            'importance_df': self.importance_df,
-            'rankings': self.feature_importance_rankings
-        }
+            # Calculate SHAP values
+            shap_values = explainer.shap_values(X)
+            
+            # For classification with multiple classes, shap_values will be a list
+            if isinstance(shap_values, list):
+                # For binary classification, we usually want the positive class
+                shap_values = shap_values[-1]
+            
+            # Process and return results
+            return self._process_importance_values(shap_values, 'shap')
+        except Exception as e:
+            print(f"Error in SHAP calculation: {str(e)}")
+            raise
     
     def _calculate_treeinterpreter_importance(self, model: Any, X: np.ndarray) -> Dict[str, Any]:
         """
@@ -171,88 +223,97 @@ class FeatureImportance:
         if hasattr(model, 'params') and 'objective' in model.params:
             print("Converting LightGBM Booster to sklearn-compatible model for treeinterpreter...")
             try:
-                import lightgbm as lgbm
-                # Use a small subset of data to create a sklearn model
-                subset_size = min(1000, X.shape[0])
-                X_subset = X[:subset_size]
-                
-                # Create a prediction target for fitting
-                y_pred = model.predict(X_subset)
-                y_pred_binary = (y_pred > 0.5).astype(int)
-                
-                # Create a sklearn-compatible model
-                sklearn_model = lgbm.LGBMClassifier()
-                
-                # Set the params from the original model when possible
-                if hasattr(model, 'params'):
-                    params = model.params.copy()
-                    if 'num_iterations' in params:
-                        params['n_estimators'] = int(params.pop('num_iterations'))
-                    sklearn_model.set_params(**{k: v for k, v in params.items() 
-                                               if k in sklearn_model.get_params()})
-                
-                # Fit the model with X_subset and predicted y
-                sklearn_model.fit(X_subset, y_pred_binary)
-                
-                # Replace the original model with the sklearn model for treeinterpreter
-                model = sklearn_model
-                print("Successfully converted LightGBM model to sklearn-compatible model")
+                model = self._convert_lightgbm_to_sklearn(model, X)
             except Exception as e:
                 print(f"Error converting LightGBM model: {str(e)}")
-                # Fall back to SHAP if treeinterpreter doesn't work
-                print("Falling back to SHAP for feature importance...")
+                print("Falling back to SHAP...")
                 return self._calculate_shap_importance(model, X)
         
         try:
+            # Check if the model is a compatible type for treeinterpreter
+            from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+            if not isinstance(model, (DecisionTreeClassifier, DecisionTreeRegressor)):
+                print("Model is not a DecisionTreeClassifier or DecisionTreeRegressor, which is required by treeinterpreter.")
+                print("Falling back to SHAP...")
+                return self._calculate_shap_importance(model, X)
+                
             # Calculate contributions using treeinterpreter
             prediction, bias, contributions = ti.predict(model, X)
             
-            # Store feature importance values
-            self.importance_values = contributions
+            # Process the contributions
+            results = self._process_importance_values(contributions, 'treeinterpreter')
             
-            # Calculate mean absolute contributions for each feature
-            mean_abs_contributions = np.abs(contributions).mean(axis=0)
+            # Add additional treeinterpreter-specific data
+            results['bias'] = bias
+            results['prediction'] = prediction
             
-            # Create DataFrame with feature names and importance values
-            if self.feature_names is not None:
-                # Make sure feature_names length matches the number of features
-                if len(self.feature_names) != mean_abs_contributions.shape[0]:
-                    print(f"Warning: feature_names length ({len(self.feature_names)}) doesn't match "
-                          f"number of features ({mean_abs_contributions.shape[0]}). Using generic feature names.")
-                    self.feature_names = [f"feature_{i}" for i in range(mean_abs_contributions.shape[0])]
-                
-                # Create feature importance DataFrame
-                self.importance_df = pd.DataFrame({
-                    'feature': self.feature_names,
-                    'importance': mean_abs_contributions
-                })
+            return results
+        except AttributeError as ae:
+            if "'LGBMClassifier' object has no attribute 'n_outputs_'" in str(ae):
+                print("LGBMClassifier model is missing n_outputs_ attribute required by treeinterpreter")
+                print("Falling back to SHAP...")
+                return self._calculate_shap_importance(model, X)
             else:
-                # Create feature importance DataFrame with generic feature names
-                self.importance_df = pd.DataFrame({
-                    'feature': [f"feature_{i}" for i in range(mean_abs_contributions.shape[0])],
-                    'importance': mean_abs_contributions
-                })
-            
-            # Sort by importance
-            self.importance_df = self.importance_df.sort_values('importance', ascending=False)
-            
-            # Create feature rankings
-            self.feature_importance_rankings = self.importance_df.copy()
-            self.feature_importance_rankings['rank'] = range(1, len(self.feature_importance_rankings) + 1)
-            
-            return {
-                'method': 'treeinterpreter',
-                'values': contributions,
-                'bias': bias,
-                'prediction': prediction,
-                'mean_abs_values': mean_abs_contributions,
-                'importance_df': self.importance_df,
-                'rankings': self.feature_importance_rankings
-            }
+                print(f"Error in treeinterpreter calculation: {str(ae)}")
+                print("Falling back to SHAP...")
+                return self._calculate_shap_importance(model, X)
+        except ValueError as ve:
+            if "Wrong model type" in str(ve):
+                print("Treeinterpreter does not support this model type. It requires DecisionTreeClassifier or DecisionTreeRegressor.")
+                print("Falling back to SHAP...")
+                return self._calculate_shap_importance(model, X)
+            else:
+                print(f"Error in treeinterpreter calculation: {str(ve)}")
+                print("Falling back to SHAP...")
+                return self._calculate_shap_importance(model, X)
         except Exception as e:
-            print(f"Error calculating treeinterpreter importance: {str(e)}")
-            print("Falling back to SHAP for feature importance...")
+            print(f"Error in treeinterpreter calculation: {str(e)}")
+            print("Falling back to SHAP...")
             return self._calculate_shap_importance(model, X)
+    
+    def _convert_lightgbm_to_sklearn(self, model: Any, X: np.ndarray) -> Any:
+        """
+        Convert a LightGBM Booster model to a sklearn-compatible model.
+        
+        Args:
+            model: LightGBM Booster model
+            X: Input features used to fit the model
+            
+        Returns:
+            Sklearn-compatible LightGBM model
+        """
+        import lightgbm as lgbm
+        
+        # Use a small subset of data to create a sklearn model
+        subset_size = min(1000, X.shape[0])
+        X_subset = X[:subset_size]
+        
+        # Create a prediction target for fitting
+        y_pred = model.predict(X_subset)
+        y_pred_binary = (y_pred > 0.5).astype(int)
+        
+        # Create a sklearn-compatible model
+        sklearn_model = lgbm.LGBMClassifier()
+        
+        # Set the params from the original model when possible
+        if hasattr(model, 'params'):
+            params = model.params.copy()
+            if 'num_iterations' in params:
+                params['n_estimators'] = int(params.pop('num_iterations'))
+            sklearn_model.set_params(**{k: v for k, v in params.items() 
+                                       if k in sklearn_model.get_params()})
+        
+        # Fit the model with X_subset and predicted y
+        sklearn_model.fit(X_subset, y_pred_binary)
+        
+        # Add n_outputs_ attribute for treeinterpreter compatibility
+        if not hasattr(sklearn_model, 'n_outputs_'):
+            # Binary classification has 1 output
+            sklearn_model.n_outputs_ = 1
+        
+        print("Successfully converted LightGBM model to sklearn-compatible model")
+        
+        return sklearn_model
     
     def save_importance_results(self, file_path: str = None) -> str:
         """
