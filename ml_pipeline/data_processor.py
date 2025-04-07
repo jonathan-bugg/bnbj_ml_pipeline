@@ -110,8 +110,8 @@ class DataProcessor:
         numerical_cols = [col for col in self.numerical_features if col not in self.leave_as_na_features]
         if numerical_cols:
             num_transformer = Pipeline(steps=[
-                ('imputer', SimpleImputer(strategy='mean')),
-                ('scaler', StandardScaler())
+                ('scaler', StandardScaler()),
+                ('imputer', SimpleImputer(strategy='mean'))     
             ])
             transformers.append(('num', num_transformer, numerical_cols))
         
